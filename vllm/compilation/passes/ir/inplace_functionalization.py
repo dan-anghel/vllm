@@ -35,7 +35,7 @@ class VllmIRInplaceFunctionalizationPass(VllmInductorPass):
     def __init__(self, vllm_config: VllmConfig) -> None:
         super().__init__(vllm_config)
         self.patterns = PatternMatcherPass(self.pass_name)
-        self.functionalized_ops: dict[str, int] = defaultdict(lambda: 0)
+        self.functionalized_ops: dict[str, int] = defaultdict(int)
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
