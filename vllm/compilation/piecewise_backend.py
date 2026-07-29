@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import contextlib
 import dataclasses
 import io
 import json
 import pickle
 from collections.abc import Callable
 from pickle import Pickler
-from typing import Any
+from typing import Any, Generator, Optional
 
 import torch._functorch.config
 import torch.fx as fx
@@ -33,12 +34,29 @@ def find_raw_node_path(obj: Any, path: str = "", memo: Any = None) -> list[str]:
         return []
     memo.add(id(obj))
 
+    if type(obj).__name__ in ('ShapeEnv', 'SymNode'):
+        return []
+
     import torch
     if isinstance(obj, torch.fx.Node):
         return [f"{path} (Node: {obj.name})"]
 
     paths = []
-    if isinstance(obj, dict):
+
+    # Explicitly handle Tensors (including FakeTensors)
+    if isinstance(obj, torch.Tensor):
+        paths.extend(find_raw_node_path(obj.shape, f"{path}.shape", memo))
+        if hasattr(obj, "grad") and obj.grad is not None:
+            paths.extend(find_raw_node_path(obj.grad, f"{path}.grad", memo))
+        if hasattr(obj, "_base") and obj._base is not None:
+             paths.extend(find_raw_node_path(obj._base, f"{path}._base", memo))
+
+    # Explicitly handle SymInt/SymFloat/SymBool
+    elif isinstance(obj, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+        if hasattr(obj, "node"):
+            paths.extend(find_raw_node_path(obj.node, f"{path}.node", memo))
+
+    elif isinstance(obj, dict):
         for k, v in obj.items():
             paths.extend(find_raw_node_path(v, f"{path}.{k}", memo))
     elif isinstance(obj, (list, tuple, set)):
@@ -57,6 +75,23 @@ def find_raw_node_path(obj: Any, path: str = "", memo: Any = None) -> list[str]:
     return paths
 
 
+@contextlib.contextmanager
+def patch_pytree_map_over_slice() -> Generator[None, None, None]:
+    import torch.utils._pytree as pytree
+    if slice in pytree.SUPPORTED_NODES:
+        yield
+        return
+
+    pytree._private_register_pytree_node(
+        slice, lambda x: ([x.start, x.stop, x.step], None), lambda x, c: slice(*x)
+    )
+
+    try:
+        yield
+    finally:
+        pytree._deregister_pytree_node(slice)
+
+
 def log_raw_node_leakage(graph: fx.GraphModule):
     logger.info("Inspecting graph for raw Node leakage in metadata...")
     found_any = False
@@ -69,6 +104,33 @@ def log_raw_node_leakage(graph: fx.GraphModule):
                     logger.warning("💥 Leakage detected: %s", p)
     if not found_any:
         logger.info("No raw Node leakage detected in graph metadata.")
+
+
+def check_args_mapping_leakage(graph: fx.GraphModule):
+    import torch.utils._pytree as pytree
+    logger.info("Verifying args/kwargs mapping picklability...")
+    mapping = {n: f"Mapped({n.name})" for n in graph.graph.nodes}
+    found_any = False
+    with patch_pytree_map_over_slice():
+        for node in graph.graph.nodes:
+            try:
+                mapped_args = pytree.tree_map_only(torch.fx.Node, lambda n: mapping[n], node.args)
+                leaks = find_raw_node_path(mapped_args, f"node({node.name}).args")
+                if leaks:
+                    found_any = True
+                    for p in leaks:
+                        logger.warning("💥 Mapping leak in args: %s", p)
+                        
+                mapped_kwargs = pytree.tree_map_only(torch.fx.Node, lambda n: mapping[n], node.kwargs)
+                leaks = find_raw_node_path(mapped_kwargs, f"node({node.name}).kwargs")
+                if leaks:
+                    found_any = True
+                    for p in leaks:
+                        logger.warning("💥 Mapping leak in kwargs: %s", p)
+            except Exception as e:
+                logger.error("Error during mapping check for node %s: %s", node.name, e)
+    if not found_any:
+        logger.info("Args/kwargs mapping verification passed.")
 
 
 def get_fake_args_from_graph(graph: fx.GraphModule) -> list[Any]:
@@ -134,6 +196,14 @@ def _compile_range_helper_clean(
     graph_index: int,
     num_graphs: int,
     is_encoder: bool,
+    # New arguments for reconstruction
+    pass_key: str,
+    model_dtype: Any,
+    device: Any,
+    hidden_size: Optional[int],
+    max_num_batched_tokens: Optional[int],
+    tp_size: int,
+    tp_rank: int,
 ) -> tuple[Any, Any]:
     """Helper function to compile a single range in a separate process with GraphPickler."""
     import sys
@@ -143,6 +213,53 @@ def _compile_range_helper_clean(
         from torch._subclasses.fake_tensor import FakeTensorMode
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
         from torch.fx._graph_pickler import GraphPickler
+        from types import SimpleNamespace
+        import vllm.distributed.parallel_state as parallel_state
+        from vllm.platforms import current_platform
+        from vllm.utils.import_utils import resolve_obj_by_qualname
+
+        # Mock TP group coordinator for passes that use get_tp_group() during init
+        class DummyDeviceGroup:
+            def __init__(self):
+                self.group_name = "dummy_group"
+                
+        class DummyGroupCoordinator:
+            def __init__(self, world_size, rank):
+                self.device_group = DummyDeviceGroup()
+                self.world_size = world_size
+                self.rank_in_group = rank
+                
+        parallel_state._TP = DummyGroupCoordinator(tp_size, tp_rank)
+
+        # Reconstruct DummyVllmConfig for pass configuration
+        class DummyModelConfig:
+            def __init__(self, dtype, hidden_size):
+                self.dtype = dtype
+                self._hidden_size = hidden_size
+            def get_hidden_size(self):
+                if self._hidden_size is None:
+                     raise AttributeError("hidden_size not available")
+                return self._hidden_size
+
+        dummy_model_config = DummyModelConfig(model_dtype, hidden_size) if model_dtype else None
+        dummy_device_config = SimpleNamespace(device=device) if device else None
+        dummy_scheduler_config = SimpleNamespace(max_num_batched_tokens=max_num_batched_tokens)
+
+        dummy_vllm_config = SimpleNamespace(
+            compilation_config=compilation_config,
+            model_config=dummy_model_config,
+            device_config=dummy_device_config,
+            scheduler_config=dummy_scheduler_config,
+        )
+
+        # Reconstruct pass manager and add back to inductor_config
+        pass_manager_cls = current_platform.get_pass_manager_cls()
+        if pass_manager_cls is not None:
+             pass_manager = resolve_obj_by_qualname(pass_manager_cls)()
+             pass_manager.configure(dummy_vllm_config)
+             
+             inductor_config = dict(inductor_config) # Copy to avoid modifying parent (though it is child's local copy anyway)
+             inductor_config[pass_key] = pass_manager
 
         fake_mode = FakeTensorMode(shape_env=ShapeEnv())
         with fake_mode:
@@ -236,6 +353,11 @@ def _clear_fake_mode_recursive(metadata: Any) -> Any:
 
 
 class PiecewiseGraphPickler(GraphPickler):
+    @classmethod
+    def dumps(cls, obj: object, options: Optional[Options] = None) -> bytes:
+        with patch_pytree_map_over_slice():
+            return super().dumps(obj, options)
+
     def reducer_override(self, obj: object) -> Any:
         import weakref
         from torch._subclasses.fake_tensor import FakeTensor
@@ -473,17 +595,41 @@ class PiecewiseBackend:
         self,
         compiler_manager: Any,
         args_list: list[Any],
+        inductor_config: dict[str, Any],
         compilation_config: Any,
         compile_range: Range,
     ) -> None:
         import pickle
         import torch
         logger.info("Checking picklability of clean arguments for range %s", compile_range)
+
+        def debug_pickle_failures(obj: Any, path: str = "", memo: Any = None):
+            if memo is None:
+                memo = set()
+            if id(obj) in memo:
+                return
+            memo.add(id(obj))
+            try:
+                pickle.dumps(obj)
+            except Exception as e:
+                logger.error("Path '%s' (type: %s) failed to pickle: %s", path, type(obj), e)
+                if isinstance(obj, torch.Tensor):
+                    logger.error("Tensor device: %s, dtype: %s, shape: %s", obj.device, obj.dtype, obj.shape)
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        debug_pickle_failures(v, f"{path}[{k!r}]", memo)
+                elif isinstance(obj, (list, tuple, set)):
+                    for i, v in enumerate(obj):
+                        debug_pickle_failures(v, f"{path}[{i}]", memo)
+                elif hasattr(obj, "__dict__"):
+                     for k, v in obj.__dict__.items():
+                         debug_pickle_failures(v, f"{path}.{k}", memo)
+
         for name, val in [
             ("clean_compiler_manager", compiler_manager),
             ("graph", self.graph),
             ("args_list", args_list),
-            ("inductor_config", self.vllm_backend.inductor_config),
+            ("inductor_config", inductor_config),
             ("clean_compilation_config", compilation_config),
         ]:
             if name == "clean_compiler_manager":
@@ -513,14 +659,7 @@ class PiecewiseBackend:
                 logger.info("Argument %s is picklable", name)
             except Exception as pe:
                 logger.error("Argument %s is NOT picklable: %s", name, pe)
-                if name == "args_list":
-                    for i, arg in enumerate(val):
-                        try:
-                            pickle.dumps(arg)
-                        except Exception as ae:
-                            logger.error("args_list[%d] (type: %s) failed to pickle: %s", i, type(arg), ae)
-                            if isinstance(arg, torch.Tensor):
-                                logger.error("Tensor device: %s, dtype: %s, shape: %s", arg.device, arg.dtype, arg.shape)
+                debug_pickle_failures(val, name)
 
     def _compile_all_ranges_sequential(
         self, ranges_to_compile: list[RangeEntry]
@@ -616,9 +755,34 @@ class PiecewiseBackend:
                     else:
                         args_list = get_fake_args_from_graph(self.graph)
                     
+                    # Extract configs for reconstruction in child
+                    model_config = self.vllm_config.model_config
+                    model_dtype = model_config.dtype if model_config else None
+                    hidden_size = model_config.get_hidden_size() if model_config else None
+                    
+                    device_config = self.vllm_config.device_config
+                    device = device_config.device if device_config else None
+                    
+                    scheduler_config = self.vllm_config.scheduler_config
+                    max_num_batched_tokens = scheduler_config.max_num_batched_tokens if scheduler_config else None
+                    
+                    from vllm.distributed import (
+                        get_tensor_model_parallel_world_size,
+                        get_tensor_model_parallel_rank,
+                    )
+                    tp_size = get_tensor_model_parallel_world_size()
+                    tp_rank = get_tensor_model_parallel_rank()
+
+                    # Clean inductor_config of unpickleable pass_manager
+                    clean_inductor_config = dict(self.vllm_backend.inductor_config)
+                    pass_key = self.vllm_backend.pass_key
+                    if pass_key in clean_inductor_config:
+                        del clean_inductor_config[pass_key]
+                    
                     self._check_arguments_picklability_clean(
                         clean_compiler_manager,
                         args_list,
+                        clean_inductor_config,
                         clean_compilation_config,
                         entry.compile_range
                     )
@@ -628,7 +792,8 @@ class PiecewiseBackend:
                         entry.compile_range
                     )
 
-                    log_raw_node_leakage(self.graph)
+                    # log_raw_node_leakage(self.graph)
+                    # check_args_mapping_leakage(self.graph)
                     options = Options(ops_filter=None)
                     graph_bytes = PiecewiseGraphPickler.dumps(self.graph, options=options)
                     args_list_bytes = PiecewiseGraphPickler.dumps(args_list, options=options)
@@ -638,12 +803,20 @@ class PiecewiseBackend:
                         clean_compiler_manager,
                         graph_bytes,
                         args_list_bytes,
-                        self.vllm_backend.inductor_config,
+                        clean_inductor_config,
                         clean_compilation_config,
                         entry.compile_range,
                         self.piecewise_compile_index,
                         self.total_piecewise_compiles,
                         self.vllm_backend.is_encoder,
+                        # Pass new args:
+                        pass_key,
+                        model_dtype,
+                        device,
+                        hidden_size,
+                        max_num_batched_tokens,
+                        tp_size,
+                        tp_rank,
                     )
 
                     logger.info(
