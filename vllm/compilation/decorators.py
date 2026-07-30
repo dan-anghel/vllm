@@ -459,6 +459,19 @@ def _support_torch_compile(
             else:
                 normalized_dims[k] = {d: None for d in v}
 
+        # Detect if the model uses Multimodal Rotary Position Embedding (MRoPE).
+        # MRoPE position tensors are 2D with shape [3, num_tokens], where dim 0 (3) is static
+        # and dim 1 (num_tokens) is dynamic. Override default 1D dynamic dim inference (dim 0) to dim 1.
+        has_config = hasattr(mod, "vllm_config")
+        config_val = getattr(mod, "vllm_config", None)
+        uses_mrope = getattr(config_val.model_config, "uses_mrope", False) if (has_config and config_val is not None) else False
+
+        if uses_mrope and "positions" in normalized_dims:
+            # For MRoPE, positions is 2D [3, tokens]. Dim 0 is static (3), Dim 1 is dynamic (tokens).
+            # If default inferred dim 0 was set, override it to dim 1.
+            if normalized_dims["positions"] == {0: None}:
+                normalized_dims["positions"] = {1: None}
+
         for k, dim_to_shape_id in normalized_dims.items():
             arg = bound_args.arguments.get(k)
 
@@ -498,6 +511,21 @@ def _support_torch_compile(
                                 )
                         else:
                             torch._dynamo.decorators.mark_unbacked(arg, dims)
+
+        # Store normalized dynamic dimension mappings onto compilation_config so downstreams
+        # (such as piecewise_backend) can distinguish dynamic vs static symbols during concretization.
+        if hasattr(mod, "compilation_config"):
+            resolved_normalized_dims = {}
+            for k, dim_to_shape_id in normalized_dims.items():
+                arg = bound_args.arguments.get(k)
+                if isinstance(arg, torch.Tensor):
+                    resolved_normalized_dims[k] = {
+                        (arg.ndim + d if d < 0 else d): shape_id
+                        for d, shape_id in dim_to_shape_id.items()
+                    }
+                else:
+                    resolved_normalized_dims[k] = dim_to_shape_id
+            mod.compilation_config.normalized_dims = resolved_normalized_dims
 
     def __call__(self: type[_T], *args: Any, **kwargs: Any) -> Any:
         # torch.compiler.is_compiling() means we are inside the compilation

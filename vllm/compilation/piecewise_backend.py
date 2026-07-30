@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pickle import Pickler
 from typing import Any
 
+import torch
 import torch._functorch.config
 import torch.fx as fx
 from torch._dynamo.utils import dynamo_timed
@@ -34,7 +35,9 @@ def get_fake_args_from_graph(graph: fx.GraphModule) -> list[Any]:
     return fake_args
 
 
-def create_concrete_args(graph: fx.GraphModule, size: int) -> list[Any]:
+def create_concrete_args(
+    graph: fx.GraphModule, size: int, compilation_config: Any = None
+) -> list[Any]:
     """Create Fake example inputs with symbolic dims replaced by a concrete size.
 
     Used for single-size compilation where we need concrete-shaped inputs.
@@ -44,12 +47,72 @@ def create_concrete_args(graph: fx.GraphModule, size: int) -> list[Any]:
     from torch._subclasses.fake_tensor import FakeTensorMode
     from torch.fx.experimental.symbolic_shapes import ShapeEnv, is_symbolic
 
+    # Classify symbols as dynamic or static based on normalized_dims
+    symbol_classification = {}
+    shape_env = None
+
+    for node in graph.graph.nodes:
+        if node.op != "placeholder":
+            break
+        val = node.meta.get("example_value")
+        if val is None or not isinstance(val, torch.Tensor):
+            continue
+
+        cleaned_name = node.name
+        if cleaned_name.startswith("l_"):
+            cleaned_name = cleaned_name[2:]
+        if cleaned_name.endswith("_"):
+            cleaned_name = cleaned_name[:-1]
+
+        normalized_dims = getattr(compilation_config, "normalized_dims", {})
+        dynamic_dims = normalized_dims.get(cleaned_name, {})
+
+        for dim, size_sym in enumerate(val.shape):
+            if not is_symbolic(size_sym):
+                continue
+
+            if shape_env is None:
+                shape_env = size_sym.node.shape_env
+
+            expr = size_sym.node.expr
+            free_syms = expr.free_symbols
+
+            is_dim_dynamic = dim in dynamic_dims
+
+            for sym in free_syms:
+                if is_dim_dynamic:
+                    symbol_classification[sym] = "dynamic"
+                else:
+                    if symbol_classification.get(sym) != "dynamic":
+                        symbol_classification[sym] = "static"
+
     def concretize(sym_val: Any) -> int:
-        """Replace all symbolic variables in a SymInt expression with size."""
+        """Replace symbolic variables in a SymInt expression.
+
+        Dynamic symbols are replaced by `size`.
+        Static symbols are replaced by their original tracing-time values.
+        """
         if not is_symbolic(sym_val):
             return int(sym_val)
         expr = sym_val.node.expr
-        return int(expr.subs({s: size for s in expr.free_symbols}))
+
+        subs_dict = {}
+        for s in expr.free_symbols:
+            if symbol_classification.get(s) == "dynamic":
+                subs_dict[s] = size
+            else:
+                if shape_env is not None:
+                    try:
+                        subs_dict[s] = shape_env.size_hint(s)
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to get size hint for symbol %s: %s", s, e
+                        )
+                        subs_dict[s] = size
+                else:
+                    subs_dict[s] = size
+
+        return int(expr.subs(subs_dict))
 
     fake_mode = FakeTensorMode(shape_env=ShapeEnv())
 
@@ -258,7 +321,9 @@ class PiecewiseBackend:
 
             if range_entry.compile_range.is_single_size():
                 args_list = create_concrete_args(
-                    self.graph, range_entry.compile_range.start
+                    self.graph,
+                    range_entry.compile_range.start,
+                    self.compilation_config,
                 )
             else:
                 args_list = get_fake_args_from_graph(self.graph)

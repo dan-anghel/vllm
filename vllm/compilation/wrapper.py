@@ -148,7 +148,7 @@ class TorchCompileWithNoGuardsWrapper:
             self._compiled_callable = torch.compile(
                 compiled_ptr,
                 fullgraph=True,
-                dynamic=False,
+                dynamic=True,
                 backend=backend,
                 options=options,
             )
