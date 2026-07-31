@@ -459,6 +459,14 @@ def _support_torch_compile(
             else:
                 normalized_dims[k] = {d: None for d in v}
 
+        # Assign a shared symbolic shape ID ("token_dim") to dimension 0 of primary sequence inputs.
+        # This ensures PyTorch Dynamo binds the symbolic size across all downstream view operations
+        # (such as aten.view in compute_logits) rather than hardcoding static bucket integers into the FX graph.
+        for arg_name in ("hidden_states", "input_ids", "inputs_embeds"):
+            if arg_name in normalized_dims:
+                if 0 in normalized_dims[arg_name]:
+                    normalized_dims[arg_name][0] = "token_dim"
+
         # Detect if the model uses Multimodal Rotary Position Embedding (MRoPE).
         # MRoPE position tensors are 2D with shape [3, num_tokens], where dim 0 (3) is static
         # and dim 1 (num_tokens) is dynamic. Override default 1D dynamic dim inference (dim 0) to dim 1.
