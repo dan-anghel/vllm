@@ -144,11 +144,20 @@ class TorchCompileWithNoGuardsWrapper:
                 msg += "upgrade PyTorch version to use AOT compile."
                 logger.warning(msg)
 
+        use_dynamic = os.getenv(
+            "VLLM_TORCH_COMPILE_DYNAMIC", "1"
+        ).lower() in ("1", "true", "yes")
+        logger.info(
+            "[TorchCompileWithNoGuardsWrapper] Initializing torch.compile for model backbone with dynamic=%s (VLLM_TORCH_COMPILE_DYNAMIC=%s)",
+            use_dynamic,
+            os.getenv("VLLM_TORCH_COMPILE_DYNAMIC"),
+        )
+
         with aot_context:
             self._compiled_callable = torch.compile(
                 compiled_ptr,
                 fullgraph=True,
-                dynamic=True,
+                dynamic=use_dynamic,
                 backend=backend,
                 options=options,
             )
@@ -179,11 +188,17 @@ class TorchCompileWithNoGuardsWrapper:
             if not self._compiled_bytecode:
                 # Make sure a compilation is triggered by clearing dynamo
                 # cache.
+                logger.info(
+                    "[TorchCompileWithNoGuardsWrapper] FIRST CALL: Triggering TorchDynamo Python tracing for backbone model!"
+                )
                 torch._dynamo.eval_frame.remove_from_cache(self.original_code_object())
                 return self._call_with_optional_nvtx_range(
                     self._compiled_callable, *args, **kwargs
                 )
             else:
+                logger.info(
+                    "[TorchCompileWithNoGuardsWrapper] SUBSEQUENT CALL: Bypassing TorchDynamo Python tracing using cached compiled bytecode!"
+                )
                 with self._dispatch_to_compiled_code():
                     return self._call_with_optional_nvtx_range(
                         self.forward, *args, **kwargs
